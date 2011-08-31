@@ -25,7 +25,7 @@
 #import <UIKit/UIKit.h>
 #else
 #import <Cocoa/Cocoa.h>
-#endif TARGET_OS_IPHONE			
+#endif //TARGET_OS_IPHONE			
 
 #include <pthread.h>
 #include <AudioToolbox/AudioToolbox.h>
@@ -171,6 +171,9 @@ extern NSString * const ASStatusChangedNotification;
 
 @property AudioStreamerErrorCode errorCode;
 @property (readonly) AudioStreamerState state;
+@property (readonly) UInt32 numberOfChannels;
+@property (readonly) double averagePower;
+@property (readonly) double peakPower;
 @property (readonly) double progress;
 @property (readonly) double duration;
 @property (readwrite) UInt32 bitRate;

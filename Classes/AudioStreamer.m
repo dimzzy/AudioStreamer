@@ -1014,6 +1014,73 @@ cleanup:
 	}
 }
 
+- (UInt32)numberOfChannels {
+	@synchronized(self) {
+
+		if (state != AS_PLAYING && state != AS_PAUSED && state != AS_BUFFERING) {
+			return 0;
+		}
+		UInt32 numberChannels = 0;
+		UInt32 size = sizeof(UInt32);
+		err = AudioQueueGetProperty(audioQueue, kAudioQueueDeviceProperty_NumberChannels, &numberChannels, &size);
+		if (err) {
+			return 0;
+		}
+		return numberChannels;
+
+	}
+}
+
+- (double)averagePower {
+	@synchronized(self) {
+
+		if (state != AS_PLAYING) {
+			return 0;
+		}
+		UInt32 numberOfChannels = self.numberOfChannels;
+		UInt32 dataSize = sizeof(AudioQueueLevelMeterState) * numberOfChannels;
+		AudioQueueLevelMeterState *levels = (AudioQueueLevelMeterState *)malloc(dataSize);
+		err = AudioQueueGetProperty(audioQueue, kAudioQueueProperty_CurrentLevelMeter, levels, &dataSize);
+		if (err) {
+			free(levels);
+			return 0;
+		} else {
+			double channelAvg = 0;
+			for (int i = 0; i < numberOfChannels; i++) {
+				channelAvg += levels[i].mAveragePower;
+			}
+			free(levels);
+			return numberOfChannels > 0 ? channelAvg / numberOfChannels : 0;
+		}
+
+	}
+}
+
+- (double)peakPower {
+	@synchronized(self) {
+
+		if (state != AS_PLAYING) {
+			return 0;
+		}
+		UInt32 numberOfChannels = self.numberOfChannels;
+		UInt32 dataSize = sizeof(AudioQueueLevelMeterState) * numberOfChannels;
+		AudioQueueLevelMeterState *levels = (AudioQueueLevelMeterState *)malloc(dataSize);
+		err = AudioQueueGetProperty(audioQueue, kAudioQueueProperty_CurrentLevelMeter, levels, &dataSize);
+		if (err) {
+			free(levels);
+			return 0;
+		} else {
+			double channelPeak = 0;
+			for (int i = 0; i < numberOfChannels; i++) {
+				channelPeak += levels[i].mPeakPower;
+			}
+			free(levels);
+			return numberOfChannels > 0 ? channelPeak / numberOfChannels : 0;
+		}
+
+	}
+}
+
 //
 // progress
 //
@@ -1506,10 +1573,19 @@ cleanup:
 		}
 	}
 
+	OSStatus ignorableError;
+
+	// enable metering
+	UInt32 metering = 1;
+	ignorableError = AudioQueueSetProperty(audioQueue, kAudioQueueProperty_EnableLevelMetering, &metering, sizeOfUInt32);
+	if (ignorableError)
+	{
+		return;
+	}
+
 	// get the cookie size
 	UInt32 cookieSize;
 	Boolean writable;
-	OSStatus ignorableError;
 	ignorableError = AudioFileStreamGetPropertyInfo(audioFileStream, kAudioFileStreamProperty_MagicCookieData, &cookieSize, &writable);
 	if (ignorableError)
 	{
