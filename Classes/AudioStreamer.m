@@ -30,6 +30,8 @@
 #define BitRateEstimationMinPackets 50
 
 NSString * const ASStatusChangedNotification = @"ASStatusChangedNotification";
+NSString * const ASMetadataChangedNotification = @"ASMetadataChangedNotification";
+NSString * const ASStreamTitleMetadata = @"StreamTitle";
 
 NSString * const AS_NO_ERROR_STRING = @"No error.";
 NSString * const AS_FILE_STREAM_GET_PROPERTY_FAILED_STRING = @"File stream get property failed.";
@@ -229,12 +231,14 @@ void ASReadStreamCallBack
 //
 // Init method for the object.
 //
-- (id)initWithURL:(NSURL *)aURL
-{
-	self = [super init];
-	if (self != nil)
-	{
+- (id)initWithURL:(NSURL *)aURL {
+	return [self initWithURL:aURL extractMetadata:NO];
+}
+
+- (id)initWithURL:(NSURL *)aURL extractMetadata:(BOOL)anExtractMetadata {
+	if ((self = [super init])) {
 		url = [aURL retain];
+		extractMetadata = anExtractMetadata;
 	}
 	return self;
 }
@@ -248,6 +252,7 @@ void ASReadStreamCallBack
 {
 	[self stop];
 	[url release];
+	[metadata release];
 	[super dealloc];
 }
 
@@ -454,11 +459,11 @@ void ASReadStreamCallBack
 - (void)mainThreadStateNotification
 {
 	NSNotification *notification =
-		[NSNotification
-			notificationWithName:ASStatusChangedNotification
-			object:self];
+	[NSNotification
+	 notificationWithName:ASStatusChangedNotification
+	 object:self];
 	[[NSNotificationCenter defaultCenter]
-		postNotification:notification];
+	 postNotification:notification];
 }
 
 //
@@ -492,6 +497,60 @@ void ASReadStreamCallBack
 			}
 		}
 	}
+}
+
+//
+// mainThreadMetadataNotification
+//
+// Method invoked on main thread to send notifications to the main thread's
+// notification center.
+//
+- (void)mainThreadMetadataNotification
+{
+	NSNotification *notification =
+	[NSNotification
+	 notificationWithName:ASMetadataChangedNotification
+	 object:self];
+	[[NSNotificationCenter defaultCenter]
+	 postNotification:notification];
+}
+
+- (void)metadataNotification {
+	@synchronized(self) {
+		if ([[NSThread currentThread] isEqual:[NSThread mainThread]]) {
+			[self mainThreadMetadataNotification];
+		} else {
+			[self performSelectorOnMainThread:@selector(mainThreadMetadataNotification)
+								   withObject:nil
+								waitUntilDone:NO];
+		}
+	}
+}
+
+- (NSString *)metadata {
+	if (!extractMetadata || metadataRemainingLength > 0) {
+		return nil;
+	}
+	return [[metadata copy] autorelease];
+}
+
+- (NSDictionary *)parseMetadata {
+	NSMutableDictionary *dict = [NSMutableDictionary dictionary];
+	NSArray *props = [self.metadata componentsSeparatedByString:@";"];
+	if (props) {
+		for (NSString *prop in props) {
+			NSArray *parts = [prop componentsSeparatedByString:@"="];
+			if ([parts count] >= 2) {
+				NSString *name = [[parts objectAtIndex:0] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+				NSString *value = [[parts objectAtIndex:1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+				value = [value stringByTrimmingCharactersInSet:[NSCharacterSet characterSetWithCharactersInString:@"'"]];
+				if (name && value) {
+					[dict setObject:value forKey:name];
+				}
+			}
+		}
+	}
+	return dict;
 }
 
 //
@@ -639,6 +698,10 @@ void ASReadStreamCallBack
 			CFHTTPMessageSetHeaderFieldValue(message, CFSTR("Range"),
 				(CFStringRef)[NSString stringWithFormat:@"bytes=%ld-%ld", seekByteOffset, fileLength]);
 			discontinuous = YES;
+		}
+		
+		if (extractMetadata) {
+			CFHTTPMessageSetHeaderFieldValue(message, CFSTR("Icy-Metadata"), CFSTR("1"));
 		}
 		
 		//
@@ -1352,6 +1415,18 @@ cleanup:
 			{
 				fileLength = [[httpHeaders objectForKey:@"Content-Length"] integerValue];
 			}
+			
+			NSString *metaint = [httpHeaders objectForKey:@"Icy-Metaint"];
+			if (metaint) {
+				metadataInterval = [metaint intValue];
+			} else {
+				metadataInterval = 0;
+			}
+			metadataOffset = metadataInterval;
+			metadataRemainingLength = 0;
+			totalBytesRead = 0;
+			[metadata release];
+			metadata = nil;
 		}
 
 		if (!audioFileStream)
@@ -1376,7 +1451,7 @@ cleanup:
 			}
 		}
 		
-		UInt8 bytes[kAQDefaultBufSize];
+		UInt8 bytes[kAQDefaultBufSize + 1];
 		CFIndex length;
 		@synchronized(self)
 		{
@@ -1402,6 +1477,73 @@ cleanup:
 			}
 		}
 
+		//
+		// Extract metadata
+		//
+		if (extractMetadata && metadataInterval > 0) {
+			//NSLog(@"bytes %d + %d", (int)totalBytesRead, (int)length);
+			//NSLog(@"meta %d / %d", (int)metadataRemainingLength, (int)metadataOffset);
+
+			if (metadataRemainingLength > 0) {
+				if (metadataRemainingLength > length) {
+					metadataRemainingLength = length;
+				}
+				UInt8 lastByte = bytes[metadataRemainingLength];
+				bytes[metadataRemainingLength] = 0;
+				NSString *metadataPart = [NSString stringWithCString:(char *)&bytes[0]
+															encoding:NSISOLatin1StringEncoding];
+				bytes[metadataRemainingLength] = lastByte;
+				//NSLog(@"metadata reminder: %@", metadataPart);
+				[metadata appendString:metadataPart];
+				[self metadataNotification];
+				if (metadataRemainingLength == length) {
+					return; // no more audio in the buffer
+				}
+				memmove(&bytes[0], &bytes[metadataRemainingLength], (length - metadataRemainingLength));
+				length -= metadataRemainingLength;
+				metadataRemainingLength = 0;
+			}
+
+			while (metadataOffset >= totalBytesRead && metadataOffset < totalBytesRead + length) {
+				CFIndex offset = metadataOffset - totalBytesRead;
+				//NSLog(@"offset %d", (int)offset);
+				size_t metadataLength = bytes[offset] * 16;
+				//NSLog(@"metalen %d", (int)metadataLength);
+				if (metadataLength > 0) {
+					if (offset + 1 + metadataLength > length) {
+						metadataRemainingLength = offset + 1 + metadataLength - length;
+						metadataLength = length - offset - 1;
+					} else {
+						metadataRemainingLength = 0;
+					}
+					UInt8 lastByte = bytes[offset + 1 + metadataLength];
+					bytes[offset + 1 + metadataLength] = 0;
+					NSString *metadataPart = [NSString stringWithCString:(char *)&bytes[offset + 1]
+																encoding:NSISOLatin1StringEncoding];
+					bytes[offset + 1 + metadataLength] = lastByte;
+					//NSLog(@"metadata part: %@", metadataPart);
+					if (!metadata) {
+						metadata = [[NSMutableString alloc] initWithString:metadataPart];
+					} else {
+						[metadata setString:metadataPart];
+					}
+					if (metadataRemainingLength == 0) {
+						[self metadataNotification];
+					}
+				} else {
+					metadataRemainingLength = 0;
+				}
+				memmove(&bytes[offset], &bytes[offset + 1 + metadataLength], (length - offset - 1 - metadataLength));
+				metadataOffset += metadataInterval;
+				length -= (1 + metadataLength);
+			}
+			totalBytesRead += length;
+			if (totalBytesRead > 0xFFFF) {
+				totalBytesRead -= 0xFFFF;
+				metadataOffset -= 0xFFFF;
+			}
+		}
+		
 		if (discontinuous)
 		{
 			err = AudioFileStreamParseBytes(audioFileStream, length, bytes, kAudioFileStreamParseFlag_Discontinuity);
